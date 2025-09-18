@@ -1,4 +1,4 @@
-name: Run PyInstaDump
+name: Run Playwright IG profile scraper
 
 on:
   workflow_dispatch:
@@ -6,65 +6,32 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Print debug (list files)
-        run: |
-          echo "== workspace =="
-          ls -la
-          echo "== pyinstadump dir =="
-          ls -la pyinstadump || true
-
-      - name: Set up Python 3.8
+      - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
-          python-version: '3.8'
-
-      - name: Show python version & pip list
-        run: |
-          python --version
-          which python
-          pip --version
-          python -m pip install --upgrade pip
-          pip list --disable-pip-version-check
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt || true
-          # If this repo uses playwright (or optional), install browsers
-          python -c "import importlib, sys; print('playwright installed?', importlib.util.find_spec('playwright') is not None)" || true
-          python -m playwright install || true
+          python -m pip install --upgrade pip
+          pip install playwright==1.44.0
+          pip install aiohttp
+          pip install --quiet --upgrade pip
+          python -m playwright install --with-deps
 
-      - name: Run PyInstaDump (debug)
+      - name: Run scraper
         env:
           COOKIES: ${{ secrets.COOKIES }}
         run: |
-          echo "Running using $(python --version)"
-          mkdir -p data
-          # Try running the module; fallback to direct file if module fails
-          set -o pipefail
-          python -m pyinstadump.main \
-            --username jimmy_on_relationships \
-            --mode followers \
-            --cookie "$COOKIES" \
-            --output data/results.csv || \
-          python pyinstadump/main.py \
-            --username jimmy_on_relationships \
-            --mode followers \
-            --cookie "$COOKIES" \
-            --output data/results.csv
-
-      - name: Show results files
-        run: |
-          echo "Data files:"
-          ls -la data || true
+          python scrape_profiles.py
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ig-results
-          path: data
+          name: ig-profile-results
+          path: data/results.csv
