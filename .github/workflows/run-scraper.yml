@@ -1,7 +1,7 @@
-name: Run IG scraper
+name: Run Instagram Profile Scraper
 
 on:
-  workflow_dispatch:   # manual trigger
+  workflow_dispatch:   # run manually from the Actions tab
 
 jobs:
   scrape:
@@ -12,12 +12,12 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
-      - name: Install system dependencies (for Playwright / browsers)
+      - name: Install system dependencies (needed for Playwright browser)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -46,30 +46,18 @@ jobs:
             ffmpeg \
             wget \
             unzip
-      - name: Upgrade pip & install Python packages
+
+      - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          # install Playwright python library explicitly
-          pip install playwright==1.44.0 aiohttp || true
-          # install Playwright browsers (now system deps are present)
+          pip install playwright==1.44.0 aiohttp
           python -m playwright install --with-deps
 
-      - name: Write cookies file from secret
-        env:
-          COOKIES: ${{ secrets.COOKIES_SECRET }}
-        run: |
-          mkdir -p data
-          # write the cookies JSON into file expected by your script
-          echo "$COOKIES" > data/www.instagram.com.cookies.json
-          ls -lah data
-
       - name: Run scraper
-        # Change this to the actual command in your repo that starts the scraper
+        env:
+          COOKIES: ${{ secrets.COOKIES }}
         run: |
-          # Example - change to your script
-          python scrape_profiles.py --cookies data/www.instagram.com.cookies.json --output data/results.csv
-        # If your repo runs differently, replace the above with the correct command.
+          python scrape_profiles.py
 
       - name: Upload results
         uses: actions/upload-artifact@v4
