@@ -1,9 +1,7 @@
 name: Run PyInstaDump
 
 on:
-  workflow_dispatch:       # lets you run manually from the Actions tab
-  schedule:
-    - cron: '0 2 * * *'    # optional: run daily at 02:00 UTC
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -13,31 +11,60 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Print debug (list files)
+        run: |
+          echo "== workspace =="
+          ls -la
+          echo "== pyinstadump dir =="
+          ls -la pyinstadump || true
+
+      - name: Set up Python 3.8
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.8'
+
+      - name: Show python version & pip list
+        run: |
+          python --version
+          which python
+          pip --version
+          python -m pip install --upgrade pip
+          pip list --disable-pip-version-check
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt || true
+          # If this repo uses playwright (or optional), install browsers
+          python -c "import importlib, sys; print('playwright installed?', importlib.util.find_spec('playwright') is not None)" || true
           python -m playwright install || true
 
-      - name: Run PyInstaDump
+      - name: Run PyInstaDump (debug)
         env:
           COOKIES: ${{ secrets.COOKIES }}
         run: |
+          echo "Running using $(python --version)"
           mkdir -p data
-          # Replace this username with whoever you want to scrape
+          # Try running the module; fallback to direct file if module fails
+          set -o pipefail
           python -m pyinstadump.main \
+            --username jimmy_on_relationships \
+            --mode followers \
+            --cookie "$COOKIES" \
+            --output data/results.csv || \
+          python pyinstadump/main.py \
             --username jimmy_on_relationships \
             --mode followers \
             --cookie "$COOKIES" \
             --output data/results.csv
 
+      - name: Show results files
+        run: |
+          echo "Data files:"
+          ls -la data || true
+
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ig-results
-          path: data/results.csv
+          path: data
