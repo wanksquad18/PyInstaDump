@@ -1,36 +1,77 @@
-name: Run Playwright IG profile scraper
+name: Run IG scraper
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # manual trigger
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.10
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install system dependencies (for Playwright / browsers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            libnss3 \
+            libatk-bridge2.0-0 \
+            libgtk-3-0 \
+            libxss1 \
+            libasound2 \
+            libgbm1 \
+            libglib2.0-0 \
+            libx11-6 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxdamage1 \
+            libxrandr2 \
+            libxinerama1 \
+            libpangocairo-1.0-0 \
+            libpango-1.0-0 \
+            libatk1.0-0 \
+            libcups2 \
+            libnspr4 \
+            libxext6 \
+            libffi-dev \
+            libx264-dev \
+            ffmpeg \
+            wget \
+            unzip
+      - name: Upgrade pip & install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install playwright==1.44.0
-          pip install aiohttp
-          pip install --quiet --upgrade pip
+          pip install -r requirements.txt || true
+          # install Playwright python library explicitly
+          pip install playwright==1.44.0 aiohttp || true
+          # install Playwright browsers (now system deps are present)
           python -m playwright install --with-deps
 
-      - name: Run scraper
+      - name: Write cookies file from secret
         env:
-          COOKIES: ${{ secrets.COOKIES }}
+          COOKIES: ${{ secrets.COOKIES_SECRET }}
         run: |
-          python scrape_profiles.py
+          mkdir -p data
+          # write the cookies JSON into file expected by your script
+          echo "$COOKIES" > data/www.instagram.com.cookies.json
+          ls -lah data
+
+      - name: Run scraper
+        # Change this to the actual command in your repo that starts the scraper
+        run: |
+          # Example - change to your script
+          python scrape_profiles.py --cookies data/www.instagram.com.cookies.json --output data/results.csv
+        # If your repo runs differently, replace the above with the correct command.
 
       - name: Upload results
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ig-profile-results
