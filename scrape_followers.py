@@ -1,9 +1,13 @@
 # scrape_followers.py
 # Scrapes followers of a target Instagram account, then scrapes each follower's bio.
+# Writes CSV to data/results.csv and (on failure) debug files like data/debug_<user>_<ts>.png/html
+#
 # Usage on GitHub Actions:
 #  - set secret COOKIES (cookie string like "csrftoken=...; sessionid=...; ...")
-#  - either set environment var TARGET_USERNAME or create usernames.txt with the target username on the first line
-# Output: data/results.csv with columns: username, biography, is_private, profile_url
+#  - add usernames.txt with the target username on the first line (or set TARGET_USERNAME env)
+#
+# Notes:
+#  - This script uses Playwright (python). The workflow installs Playwright and browsers.
 
 import os
 import csv
@@ -12,7 +16,7 @@ import time
 from typing import List, Dict, Any
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# CONFIG
+# CONFIG (can be overridden by env in workflow)
 USERNAMES_FILE = "usernames.txt"      # optional: put target username here (first line)
 OUT_DIR = "data"
 OUT_FILE = os.path.join(OUT_DIR, "results.csv")
@@ -21,6 +25,7 @@ TARGET_USERNAME_ENV = os.environ.get("TARGET_USERNAME", "").strip()
 FOLLOWERS_LIMIT = int(os.environ.get("FOLLOWERS_LIMIT", "1000"))  # how many followers to fetch (max)
 SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", "0.6"))     # pause between scrolls in seconds
 PROFILE_DELAY = float(os.environ.get("PROFILE_DELAY", "0.8"))    # delay between visiting follower profiles
+HEADER_TIMEOUT_MS = int(os.environ.get("HEADER_TIMEOUT_MS", "45000"))  # header selector timeout
 
 # Helpers
 def cookie_string_to_list(cookie_str: str):
@@ -43,18 +48,31 @@ def cookie_string_to_list(cookie_str: str):
 async def open_followers_modal(page, target_username: str) -> None:
     profile_url = f"https://www.instagram.com/{target_username}/"
     await page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+    # Wait for profile header (longer timeout)
     try:
-        await page.wait_for_selector("header", timeout=20000)
+        await page.wait_for_selector("header", timeout=HEADER_TIMEOUT_MS)
     except PWTimeout:
         print("Timeout waiting for profile header.")
+    # Try several strategies to click followers link
     try:
+        # Strategy 1: anchor with href ending in /followers/
         btn = await page.query_selector('header a[href$="/followers/"]')
         if not btn:
+            # Strategy 2: anchor inside header containing text "followers" (case-insensitive)
             btn = await page.query_selector('//header//a[contains(translate(., "FOLLOWERS", "followers"), "followers")]')
         if not btn:
+            # Strategy 3: take the second anchor in the header stats (followers is usually second)
             btns = await page.query_selector_all("header ul li a")
             if len(btns) >= 2:
                 btn = btns[1]
+        if not btn:
+            # Strategy 4: find any link whose href contains '/followers/'
+            anchors = await page.query_selector_all("a")
+            for a in anchors:
+                href = await a.get_attribute("href") or ""
+                if "/followers/" in href:
+                    btn = a
+                    break
         if not btn:
             raise Exception("Followers link/button not found on profile page.")
         await btn.click()
@@ -95,9 +113,11 @@ async def scrape_followers_from_modal(page, limit:int) -> List[str]:
             attempts += 1
         else:
             attempts = 0
-        if attempts >= 5:
+        if attempts >= 6:
+            # no growth after several scrolls -> break
             break
         previous_count = len(usernames)
+        # scroll to bottom of container
         await page.evaluate('(el) => { el.scrollTop = el.scrollHeight; }', scrollable)
         await asyncio.sleep(SCROLL_PAUSE)
     return usernames[:limit]
@@ -108,6 +128,7 @@ async def fetch_profile_info(page, username:str) -> Dict[str,Any]:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
     except PWTimeout:
         pass
+    # try internal web_profile_info endpoint via in-page fetch (requires cookies)
     try:
         resp = await page.evaluate(
             """async (u) => {
@@ -122,7 +143,6 @@ async def fetch_profile_info(page, username:str) -> Dict[str,Any]:
             }""",
             username
         )
-        # resp in JS structure; map to python dict if possible
         if isinstance(resp, dict) and resp.get("ok") and resp.get("data"):
             user = resp["data"].get("data", {}).get("user")
             if user:
@@ -134,6 +154,7 @@ async def fetch_profile_info(page, username:str) -> Dict[str,Any]:
                 }
     except Exception:
         pass
+    # fallback: ld+json
     try:
         ld = await page.query_selector('script[type="application/ld+json"]')
         if ld:
@@ -150,6 +171,7 @@ async def fetch_profile_info(page, username:str) -> Dict[str,Any]:
                 pass
     except Exception:
         pass
+    # final fallback: meta description
     try:
         meta = await page.query_selector('meta[name="description"]')
         if meta:
@@ -161,6 +183,7 @@ async def fetch_profile_info(page, username:str) -> Dict[str,Any]:
     return {"username": username, "biography": "", "is_private": False, "profile_url": url}
 
 async def main():
+    # determine target username
     target = TARGET_USERNAME_ENV
     if not target:
         if os.path.exists(USERNAMES_FILE):
@@ -176,9 +199,13 @@ async def main():
     if not COOKIES_ENV:
         print("WARNING: COOKIES env var is empty. You may be logged out or hit login redirects.")
 
-    cookies = cookie_string_to_list(COOKIES_ENV)
-
+    # ensure output dir and write a header (so artifact exists even on early failure)
     os.makedirs(OUT_DIR, exist_ok=True)
+    with open(OUT_FILE, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=["username","biography","is_private","profile_url"])
+        writer.writeheader()
+
+    cookies = cookie_string_to_list(COOKIES_ENV)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -194,13 +221,28 @@ async def main():
                     "secure": c.get("secure", True)
                 } for c in cookies])
                 print(f"Added {len(cookies)} cookies.")
+                # print cookie keys (safe debug)
+                keys = [p.get("name") for p in cookies if p.get("name")]
+                print("Cookie names provided:", keys)
             except Exception as e:
                 print("Failed to add cookies:", e)
         page = await context.new_page()
 
+        # open target profile and open followers modal
         try:
             await open_followers_modal(page, target)
         except Exception as e:
+            # debug capture
+            timestamp = int(time.time())
+            safe_name = target.replace("/", "_")
+            try:
+                await page.screenshot(path=f"data/debug_{safe_name}_{timestamp}.png", full_page=True)
+                html = await page.content()
+                with open(f"data/debug_{safe_name}_{timestamp}.html", "w", encoding="utf-8") as fh:
+                    fh.write(html)
+                print(f"Saved debug screenshot and html: data/debug_{safe_name}_{timestamp}.png/html")
+            except Exception as inner_e:
+                print("Failed to save debug artifacts:", inner_e)
             print("Failed to open followers modal:", e)
             await browser.close()
             return 1
@@ -228,6 +270,7 @@ async def main():
 
         await browser.close()
 
+    # write CSV (overwrite header with full results)
     with open(OUT_FILE, "w", newline="", encoding="utf-8") as csvfile:
         fieldnames = ["username", "biography", "is_private", "profile_url"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
