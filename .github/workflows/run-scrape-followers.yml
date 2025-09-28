@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 240
 
     env:
-      FOLLOWERS_LIMIT: '500'   # change to desired number (string)
+      FOLLOWERS_LIMIT: '1000'   # change to desired number (string)
       PROFILE_DELAY: '0.8'
       SCROLL_PAUSE: '0.6'
       HEADER_TIMEOUT_MS: '45000'
