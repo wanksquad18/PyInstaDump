@@ -1,8 +1,5 @@
 name: Run Instagram Follower Scraper
 
-# Triggers:
-# - manual run via Actions UI
-# - scheduled run daily at 02:00 UTC (change or remove as desired)
 on:
   workflow_dispatch:
   schedule:
@@ -14,12 +11,10 @@ jobs:
     timeout-minutes: 240
 
     env:
-      # How many followers to collect (override by editing workflow or add env secret)
-      FOLLOWERS_LIMIT: '1000'
-      # Optional small delay between profile visits (seconds)
+      FOLLOWERS_LIMIT: '500'   # change to desired number (string)
       PROFILE_DELAY: '0.8'
-      # Optional scroll pause (seconds)
       SCROLL_PAUSE: '0.6'
+      HEADER_TIMEOUT_MS: '45000'
 
     steps:
       - name: Checkout repo
@@ -65,37 +60,35 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install playwright aiohttp; fi
-          # Install Playwright browsers (with system deps)
           python -m playwright install --with-deps
 
-      - name: Show environment & files (debug)
+      - name: Show debug info
         run: |
-          echo "FOLLOWERS_LIMIT=$FOLLOWERS_LIMIT"
-          echo "PROFILE_DELAY=$PROFILE_DELAY"
-          echo "SCROLL_PAUSE=$SCROLL_PAUSE"
-          ls -la
-          echo "usernames.txt:"
+          echo "FOLLOWERS_LIMIT=${{ env.FOLLOWERS_LIMIT }}"
+          echo "PROFILE_DELAY=${{ env.PROFILE_DELAY }}"
+          echo "SCROLL_PAUSE=${{ env.SCROLL_PAUSE }}"
+          echo "HEADER_TIMEOUT_MS=${{ env.HEADER_TIMEOUT_MS }}"
+          echo "usernames.txt (first 20 lines):"
           sed -n '1,20p' usernames.txt || true
 
       - name: Run follower scraper
         env:
-          # Pass cookie secret into the script via env
           COOKIES: ${{ secrets.COOKIES }}
-          # Optional override limit here (string)
           FOLLOWERS_LIMIT: ${{ env.FOLLOWERS_LIMIT }}
           PROFILE_DELAY: ${{ env.PROFILE_DELAY }}
           SCROLL_PAUSE: ${{ env.SCROLL_PAUSE }}
+          HEADER_TIMEOUT_MS: ${{ env.HEADER_TIMEOUT_MS }}
         run: |
           mkdir -p data
-          # Run the follower scraper script (must exist at repo root)
-          python scrape_followers.py
-          # show first lines of output for logs
+          python scrape_followers.py || true
           echo "---- results.csv preview ----"
-          head -n 20 data/results.csv || true
+          head -n 40 data/results.csv || true
+          echo "---- debug files in data/ ----"
+          ls -la data || true
 
-      - name: Upload results artifact
+      - name: Upload all data files (results + debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ig-profile-results
-          path: data/results.csv
+          path: data/*
