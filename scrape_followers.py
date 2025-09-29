@@ -3,7 +3,7 @@
 scrape_followers.py
 
 Playwright-based follower scraper which:
- - loads Instagram session cookies (from env COOKIES or data/www.instagram.com.cookies.json)
+ - loads Instagram session cookies (from env COOKIES or COOKIES_SECRET or data/www.instagram.com.cookies.json)
  - opens target profile (env TARGET_USERNAME)
  - opens followers modal, scrolls and extracts follower usernames (and optionally visits profile for bio)
  - saves results to data/results.csv
@@ -23,8 +23,9 @@ from playwright.async_api import async_playwright, Page, Browser, TimeoutError a
 # ----- Config (controlled via env) -----
 TARGET = os.environ.get("TARGET_USERNAME") or os.environ.get("target_username") or "thepreetjohal"
 FOLLOWERS_LIMIT = int(os.environ.get("FOLLOWERS_LIMIT", "500"))  # how many followers to fetch
-COOKIES_ENV = os.environ.get("COOKIES")  # optional: stringified JSON of cookies
-COOKIES_FILE = Path("data/www.instagram.com.cookies.json")  # optional file
+# Script will try COOKIES, then COOKIES_SECRET, then data/www.instagram.com.cookies.json
+COOKIES_ENV = os.environ.get("COOKIES") or os.environ.get("COOKIES_SECRET")
+COOKIES_FILE = Path("data/www.instagram.com.cookies.json")  # optional file fallback
 HEADLESS = os.environ.get("HEADLESS", "true").lower() not in ("false", "0", "no")
 PROFILE_DELAY = float(os.environ.get("PROFILE_DELAY", "0.8"))  # delay between profile visits (secs)
 SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", "0.6"))
@@ -32,26 +33,32 @@ RESULTS_PATH = Path("data/results.csv")
 DEBUG_DIR = Path("data")
 TIMEOUT = int(os.environ.get("HEADER_TIMEOUT_MS", "45000"))  # ms for wait_for_selector
 
+# ensure folders
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 Path("data").mkdir(parents=True, exist_ok=True)
+
 
 # ----- Helpers -----
 
 
 def load_cookies() -> Optional[List[Dict]]:
-    """Load cookies from COOKIES env or cookie file. Return list or None."""
-    if COOKIES_ENV:
+    """Load cookies from COOKIES env (or COOKIES_SECRET) or cookie file. Return list or None."""
+    # Try environment first
+    raw = COOKIES_ENV
+    if raw:
         try:
-            val = COOKIES_ENV.strip()
-            # If it's a JSON array string, parse it
-            cookies = json.loads(val)
-            if isinstance(cookies, list):
-                return cookies
-            # maybe env contains object with field 'cookies'
-            if isinstance(cookies, dict) and "cookies" in cookies:
-                return cookies["cookies"]
+            parsed = json.loads(raw)
+            # cookie array
+            if isinstance(parsed, list):
+                return parsed
+            # maybe an object with 'cookies' field
+            if isinstance(parsed, dict) and "cookies" in parsed:
+                return parsed["cookies"]
+            # if it's a dict of cookie-name:value, convert to Playwright format? unlikely; we skip
+            print("COOKIES env parsed but shape unexpected (not list).")
         except Exception as e:
             print("Failed to parse COOKIES env as JSON:", e)
+    # Try cookie file
     if COOKIES_FILE.exists():
         try:
             with COOKIES_FILE.open("r", encoding="utf-8") as fh:
@@ -60,6 +67,7 @@ def load_cookies() -> Optional[List[Dict]]:
                     return data
                 if isinstance(data, dict) and "cookies" in data:
                     return data["cookies"]
+                print("Cookie file parsed but shape unexpected.")
         except Exception as e:
             print("Failed to read cookies file:", e)
     return None
@@ -81,7 +89,7 @@ async def save_debug_artifacts(page: Page, target: str):
 
 
 async def apply_cookies(context, cookies):
-    # cookies expected in Playwright format: list of dicts including 'name','value','domain','path' optionally expires/httpOnly/secure/sameSite
+    # cookies expected in Playwright format: list of dicts including 'name','value','domain','path'
     try:
         await context.add_cookies(cookies)
         print(f"Applied {len(cookies)} cookies to context")
@@ -110,13 +118,10 @@ async def open_followers_modal(page: Page, target: str):
     profile_url = f"https://www.instagram.com/{target}/"
     await page.goto(profile_url, wait_until="networkidle")
     # Wait for follower link to be present
-    # follower link has text like "followers" under profile area; we target anchor with href ending with /followers/
     try:
-        # try find button/anchor that leads to followers dialog
-        # multiple selector strategies because IG changes UI frequently
         follower_selector_options = [
             f'a[href="/{target}/followers/"]',
-            'a[href$="/followers/"]',  # fallback
+            'a[href$="/followers/"]',
             'li a[href*="/followers"]',
             'section a[href*="/followers"]',
             'button:has-text("followers")',
@@ -131,11 +136,9 @@ async def open_followers_modal(page: Page, target: str):
                 btn = None
         if not btn:
             raise Exception("Could not find followers link/button on profile")
-        # click it
         await btn.click()
-        # wait for modal dialog to appear (a div with role=dialog or ul with role=listbox). Use timeout
+        # wait for modal dialog to appear
         await page.wait_for_selector('div[role="dialog"] ul', timeout=TIMEOUT)
-        # return modal root
         modal = await page.query_selector('div[role="dialog"] ul')
         return modal
     except Exception as e:
@@ -147,14 +150,11 @@ async def scroll_followers_modal(page: Page, modal, limit: int) -> List[str]:
     usernames = []
     prev_count = 0
     scroll_retries = 0
-    MAX_RETRIES = 6
-    # modal is the ul element that contains li elements; we will repeatedly evaluate JS to scroll it
+    MAX_RETRIES = 8
     while len(usernames) < limit and scroll_retries < MAX_RETRIES:
-        # read currently visible usernames
         try:
             items = await page.query_selector_all('div[role="dialog"] ul li')
             for item in items:
-                # username is anchor text in li -> a
                 a = await item.query_selector('a[href^="/"]')
                 if not a:
                     continue
@@ -165,7 +165,7 @@ async def scroll_followers_modal(page: Page, modal, limit: int) -> List[str]:
                         break
         except Exception as e:
             print("Error while extracting usernames from modal:", e)
-        # scroll modal down
+        # scroll modal
         try:
             await page.evaluate(
                 """() => {
@@ -177,7 +177,6 @@ async def scroll_followers_modal(page: Page, modal, limit: int) -> List[str]:
             )
         except Exception as e:
             print("Scroll JS failed:", e)
-        # wait a bit to let new items load
         await asyncio.sleep(SCROLL_PAUSE)
         if len(usernames) == prev_count:
             scroll_retries += 1
@@ -193,18 +192,15 @@ async def fetch_profile_data(page: Page, username: str) -> Dict:
     data = {"username": username, "bio": "", "is_private": "", "is_verified": "", "profile_pic_url": ""}
     try:
         await page.goto(profile_url, wait_until="networkidle")
-        # read simple selectors
-        # bio: within <div> with role presentation and contains span (IG structure changes frequently)
-        # attempt a few strategies:
         bio = ""
         try:
+            # heuristic selectors for bio
             el = await page.query_selector('div[data-testid="user-bio"]')
             if el:
                 bio = (await (await el.get_property("textContent")).json_value()).strip()
         except Exception:
             bio = ""
         if not bio:
-            # fallback selectors:
             try:
                 bio_el = await page.query_selector('header section div div span')
                 if bio_el:
@@ -212,14 +208,13 @@ async def fetch_profile_data(page: Page, username: str) -> Dict:
             except Exception:
                 bio = ""
         data["bio"] = bio or ""
-        # private / verified / profile pic
+        # private detection (best-effort)
         try:
-            # private - often appears as "This Account is Private" text, or private profiles have a locked icon
-            private_el = await page.query_selector('article header div:has(svg[aria-label="Private"])')
-            data["is_private"] = "Yes" if private_el else "No"
+            private_text = await page.query_selector('//main//div[contains(text(), "This Account is Private")]')
+            data["is_private"] = "Yes" if private_text else "No"
         except Exception:
             data["is_private"] = ""
-        # verified - check for verified badge (svg with title or aria-label)
+        # verified detection (badge)
         try:
             verified = await page.query_selector('header svg[aria-label="Verified"]')
             data["is_verified"] = "Yes" if verified else "No"
@@ -246,22 +241,19 @@ async def run():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-setuid-sandbox"])
         context = await browser.new_context()
-        # apply cookies if present
         if cookies:
-            # ensure cookie domains are compatible with Playwright (must include url or domain/path)
             await apply_cookies(context, cookies)
         page = await context.new_page()
-        # accept standard navigation timeouts
         page.set_default_timeout(TIMEOUT)
 
-        # go to instagram and ensure base content is reachable
+        # try homepage
         try:
             await page.goto("https://www.instagram.com/", wait_until="networkidle")
             print("Reached instagram.com")
         except Exception as e:
             print("Failed to reach Instagram homepage:", e)
 
-        # open target profile and followers modal
+        # open modal
         try:
             modal = await open_followers_modal(page, TARGET)
         except Exception as e:
@@ -274,15 +266,12 @@ async def run():
             await browser.close()
             return 1
 
-        # scroll modal to collect usernames
         print("Collecting usernames from followers modal...")
         usernames = await scroll_followers_modal(page, modal, FOLLOWERS_LIMIT)
         print(f"Collected {len(usernames)} usernames from modal (limit {FOLLOWERS_LIMIT})")
 
-        # Optionally visit each profile to collect bio + flags
         results = []
         for i, uname in enumerate(usernames, 1):
-            # light delay to reduce suspicious load
             try:
                 profile_data = await fetch_profile_data(page, uname)
             except Exception as e:
@@ -293,7 +282,6 @@ async def run():
                 print(f"Visited {i}/{len(usernames)} profiles")
             await asyncio.sleep(PROFILE_DELAY)
 
-        # write CSV results
         write_results_csv(results, RESULTS_PATH)
 
         await browser.close()
@@ -302,5 +290,4 @@ async def run():
 
 if __name__ == "__main__":
     code = asyncio.run(run())
-    # exit code 0 or 1 helps CI interpret results
     exit(code)
