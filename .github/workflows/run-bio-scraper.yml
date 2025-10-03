@@ -1,12 +1,13 @@
-name: Run Bio Scraper
+name: Run Instagram Bio Extractor
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # run manually from GitHub Actions tab
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -16,24 +17,56 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install system dependencies (for Playwright / browsers)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            libnss3 \
+            libatk-bridge2.0-0 \
+            libgtk-3-0 \
+            libxss1 \
+            libasound2t64 \
+            libasound2-data \
+            libgbm1 \
+            libglib2.0-0 \
+            libx11-6 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxdamage1 \
+            libxrandr2 \
+            libxinerama1 \
+            libpangocairo-1.0-0 \
+            libpango-1.0-0 \
+            libatk1.0-0 \
+            libcups2 \
+            libnspr4 \
+            libxext6 \
+            libffi-dev \
+            libx264-dev \
+            ffmpeg \
+            wget \
+            unzip || true
+
+      - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install playwright
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install playwright aiohttp; fi
           python -m playwright install --with-deps
 
-      - name: Save cookies file (optional)
-        # optional: if your script expects a cookies file (we parse env by default)
-        run: |
-          echo "$COOKIES_SECRET" > www.instagram.com.cookies.json
+      - name: Prepare cookies file
         env:
           COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
+        run: |
+          mkdir -p data
+          if [ -z "$COOKIES_SECRET" ]; then
+            echo "ERROR: COOKIES_SECRET secret not set!"
+            exit 1
+          fi
+          echo "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
+          echo "Wrote cookies.json (size: $(wc -c < data/www.instagram.com.cookies.json) bytes)"
 
       - name: Run scraper
-        env:
-          COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
-          # optional: override usernames; otherwise create usernames.txt in repo root
-          # USERNAMES: "thepreetjohal,another_user"
         run: |
           mkdir -p data
           python scrape_profiles.py
@@ -41,5 +74,5 @@ jobs:
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: ig-profile-results
+          name: ig-results
           path: data
