@@ -1,0 +1,45 @@
+name: Run Bio Scraper
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps
+
+      - name: Save cookies file (optional)
+        # optional: if your script expects a cookies file (we parse env by default)
+        run: |
+          echo "$COOKIES_SECRET" > www.instagram.com.cookies.json
+        env:
+          COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
+
+      - name: Run scraper
+        env:
+          COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
+          # optional: override usernames; otherwise create usernames.txt in repo root
+          # USERNAMES: "thepreetjohal,another_user"
+        run: |
+          mkdir -p data
+          python scrape_profiles.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ig-profile-results
+          path: data
