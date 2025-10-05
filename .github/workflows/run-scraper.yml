@@ -1,23 +1,45 @@
-name: Run IG Scraper (run_scraper.py wrapper)
+name: Run Instagram Scraper (diagnose + run)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      FOLLOWERS_LIMIT: "1000"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
+      - name: Show repo files (for debugging)
+        run: |
+          echo "Repo root listing:"
+          ls -la
+
+      - name: Ensure a scraper file exists
+        id: detect_scraper
+        run: |
+          if [ -f scrape_profiles.py ]; then
+            echo "scrape_profiles.py found"
+            echo "scraper=scrape_profiles.py" >> "$GITHUB_OUTPUT"
+          elif [ -f scrape_followers.py ]; then
+            echo "scrape_followers.py found"
+            echo "scraper=scrape_followers.py" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: No scraper file found in repo root. Please add scrape_profiles.py or scrape_followers.py"
+            ls -la
+            exit 1
+          fi
+
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
-      - name: Install system dependencies required by Playwright (non-fatal)
+      - name: Install system dependencies required by browsers
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
@@ -37,22 +59,150 @@ jobs:
           fi
           python -m playwright install --with-deps
 
-      - name: Run wrapper script (writes cookies, diagnostics, runs scraper)
+      - name: Write cookies file from secret and validate JSON
+        id: write_cookies
         env:
           COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p data cookies
-          python run_scraper.py
+          if [ -z "${COOKIES_SECRET:-}" ]; then
+            echo "ERROR: COOKIES_SECRET is empty. Add a repository secret named COOKIES_SECRET containing the JSON array of cookies."
+            exit 1
+          fi
 
-      - name: Show results preview + list data/
+          printf "%s" "$COOKIES_SECRET" > www.instagram.com.cookies.json
+          printf "%s" "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
+          printf "%s" "$COOKIES_SECRET" > cookies/www.instagram.com.cookies.json
+
+          # Validate with a small Python script written to a file (avoids YAML/heredoc issues)
+          cat > validate_cookies.py <<'PY'
+import json, sys
+paths = [
+    "www.instagram.com.cookies.json",
+    "data/www.instagram.com.cookies.json",
+    "cookies/www.instagram.com.cookies.json",
+]
+ok = False
+for p in paths:
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            print("Parsed cookie file:", p, "entries:", len(data))
+            print("Cookie names (sample up to 20):", [c.get("name") for c in data[:20]])
+            ok = True
+            break
+    except Exception as e:
+        print("Failed to parse", p, ":", e)
+if not ok:
+    print("ERROR: could not parse any cookie file. Exiting.", file=sys.stderr)
+    sys.exit(2)
+PY
+          python validate_cookies.py
+
+      - name: Diagnostic: test cookies + fetch one profile (saves data/debug_diagnose.html)
+        shell: bash
         run: |
-          echo "=== data/ listing ==="
-          ls -la data || true
-          echo
-          echo "=== results.csv preview (if exists) ==="
-          if [ -f data/results.csv ]; then head -n 80 data/results.csv || true; else echo "No data/results.csv produced"; fi
+          python -m pip install --upgrade pip requests
 
-      - name: Upload artifacts (results + debug HTML/PNG + cookie copies)
+          cat > diag.py <<'PY'
+import json, os, sys, re, requests
+paths = [
+    "data/www.instagram.com.cookies.json",
+    "www.instagram.com.cookies.json",
+    "cookies/www.instagram.com.cookies.json",
+]
+cookie_list = None
+for p in paths:
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                cookie_list = json.load(f)
+            print("Using cookie file:", p)
+            break
+        except Exception as e:
+            print("Failed to parse", p, e)
+
+if not cookie_list:
+    print("ERROR: no cookie JSON found or parse failed. Aborting diagnostic.")
+    sys.exit(2)
+
+def to_dict(lst):
+    d = {}
+    for c in lst:
+        n = c.get("name"); v = c.get("value")
+        if n and v:
+            d[n] = v
+    return d
+
+cookie_dict = to_dict(cookie_list)
+print("Cookie keys (sample up to 20):", list(cookie_dict.keys())[:20])
+for reqk in ("sessionid","ds_user_id","csrftoken"):
+    print(reqk, "present:", reqk in cookie_dict)
+
+headers = {
+    "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36"
+}
+test_user = "thepreetjohal"
+url = f"https://www.instagram.com/{test_user}/"
+print("GET", url)
+try:
+    r = requests.get(url, cookies=cookie_dict, headers=headers, timeout=30)
+except Exception as e:
+    print("Request failed:", e)
+    sys.exit(3)
+
+print("HTTP status:", r.status_code)
+m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.I|re.S)
+title = m.group(1).strip() if m else ""
+print("Page title:", title[:200])
+
+os.makedirs("data", exist_ok=True)
+with open("data/debug_diagnose.html","w",encoding="utf-8") as fh:
+    fh.write(r.text)
+print("Saved data/debug_diagnose.html size:", len(r.text))
+
+if r.status_code in (403,429):
+    print("Blocked or rate-limited (status code)", r.status_code)
+    sys.exit(4)
+if "Log in" in title or "Login" in title or "Sign up" in title:
+    print("Heuristic: login page returned (cookies invalid or blocked).")
+    sys.exit(5)
+
+print("Diagnostic looks OK (profile page returned).")
+sys.exit(0)
+PY
+          python diag.py
+
+      - name: Run detected scraper
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          echo "Detected scraper: ${{ steps.detect_scraper.outputs.scraper }}"
+          if [ "${{ steps.detect_scraper.outputs.scraper }}" = "scrape_profiles.py" ]; then
+            echo "Running scrape_profiles.py"
+            python scrape_profiles.py
+          elif [ "${{ steps.detect_scraper.outputs.scraper }}" = "scrape_followers.py" ]; then
+            echo "Running scrape_followers.py"
+            python scrape_followers.py
+          else
+            echo "No known scraper detected; aborting"
+            exit 1
+          fi
+
+      - name: Show results preview and data folder listing
+        run: |
+          echo "=== results.csv preview (first 40 lines) ==="
+          if [ -f data/results.csv ]; then head -n 40 data/results.csv || true; else echo "No data/results.csv produced"; fi
+          echo
+          echo "=== data folder listing ==="
+          ls -la data || true
+          echo "=== root listing ==="
+          ls -la
+
+      - name: Upload artifacts (results + debug HTML/png)
         uses: actions/upload-artifact@v4
         with:
           name: ig-scraper-artifacts
