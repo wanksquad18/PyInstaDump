@@ -1,194 +1,206 @@
-#!/usr/bin/env python3
-"""
-run_scraper.py
+name: Run Instagram Scraper (diagnose + run)
 
-- Reads COOKIES_SECRET from env (must be a JSON array string of cookies).
-- Writes cookie JSON to:
-    - www.instagram.com.cookies.json
-    - data/www.instagram.com.cookies.json
-    - cookies/www.instagram.com.cookies.json
-  (some scrapers expect different locations)
-- Validates JSON and prints cookie names for debug.
-- Performs a lightweight diagnostic GET of one profile to ensure cookies work
-  and writes data/debug_diagnose.html so you can inspect the HTML.
-- Runs scrape_profiles.py (expects it to exist in repo root).
-- Exits with the same exit code as the scraper.
-"""
+on:
+  workflow_dispatch: {}
 
-import os
-import sys
-import json
-import time
-import subprocess
-from pathlib import Path
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      FOLLOWERS_LIMIT: "1000"
 
-DEBUG_TEST_USERNAME = os.environ.get("DIAGNOSE_USERNAME") or "thepreetjohal"
-COOKIE_OUT_PATHS = [
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show repo files (for debugging)
+        run: |
+          echo "Repo root listing:"
+          ls -la
+
+      - name: Ensure a scraper file exists
+        id: detect_scraper
+        run: |
+          if [ -f scrape_profiles.py ]; then
+            echo "scrape_profiles.py found"
+            echo "scraper=scrape_profiles.py" >> "$GITHUB_OUTPUT"
+          elif [ -f scrape_followers.py ]; then
+            echo "scrape_followers.py found"
+            echo "scraper=scrape_followers.py" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: No scraper file found in repo root. Please add scrape_profiles.py or scrape_followers.py"
+            ls -la
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install system dependencies required by browsers
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates libnss3 libatk-bridge2.0-0 libgtk-3-0 libxss1 \
+            libasound2 libasound2-data libgbm1 libglib2.0-0 libx11-6 \
+            libxcomposite1 libxcursor1 libxdamage1 libxrandr2 libxinerama1 \
+            libpangocairo-1.0-0 libpango-1.0-0 libatk1.0-0 libcups2 libnspr4 \
+            libxext6 libffi-dev libx264-dev ffmpeg wget unzip || true
+
+      - name: Install Python packages & Playwright browsers
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install playwright requests aiohttp
+          fi
+          python -m playwright install --with-deps
+
+      - name: Write cookies file from secret and validate JSON
+        id: write_cookies
+        env:
+          COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data cookies
+          if [ -z "${COOKIES_SECRET:-}" ]; then
+            echo "ERROR: COOKIES_SECRET is empty. Add a repository secret named COOKIES_SECRET containing the JSON array of cookies."
+            exit 1
+          fi
+
+          printf "%s" "$COOKIES_SECRET" > www.instagram.com.cookies.json
+          printf "%s" "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
+          printf "%s" "$COOKIES_SECRET" > cookies/www.instagram.com.cookies.json
+
+          # Validate with a small Python script written to a file (avoids YAML/heredoc issues)
+          cat > validate_cookies.py <<'PY'
+import json, sys
+paths = [
     "www.instagram.com.cookies.json",
     "data/www.instagram.com.cookies.json",
     "cookies/www.instagram.com.cookies.json",
 ]
-
-def load_secret_and_write(secret_env_name="COOKIES_SECRET"):
-    s = os.environ.get(secret_env_name)
-    if not s:
-        print(f"ERROR: Environment variable {secret_env_name} is empty. Set repository secret with that name.")
-        return False
-
-    # some flows put a JSON string with escaped newlines; try best-effort cleaning
-    candidate = s.strip()
-    # If someone pasted multi-line JSON into the secret, it will come through with newlines already.
-    # If the secret looks like it's been JSON-encoded inside the secret (e.g. "\"[ {..} ]\""),
-    # try to decode twice.
-    parsed = None
+ok = False
+for p in paths:
     try:
-        parsed = json.loads(candidate)
-    except Exception:
-        # try replacing escaped newline sequences and reparse
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            print("Parsed cookie file:", p, "entries:", len(data))
+            print("Cookie names (sample up to 20):", [c.get("name") for c in data[:20]])
+            ok = True
+            break
+    except Exception as e:
+        print("Failed to parse", p, ":", e)
+if not ok:
+    print("ERROR: could not parse any cookie file. Exiting.", file=sys.stderr)
+    sys.exit(2)
+PY
+          python validate_cookies.py
+
+      - name: Diagnostic: test cookies + fetch one profile (saves data/debug_diagnose.html)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip requests
+          cat > diag.py <<'PY'
+import json, os, sys, re, requests
+paths = [
+    "data/www.instagram.com.cookies.json",
+    "www.instagram.com.cookies.json",
+    "cookies/www.instagram.com.cookies.json",
+]
+cookie_list = None
+for p in paths:
+    if os.path.exists(p):
         try:
-            fixed = candidate.replace('\\n', '\n').replace('\\t', '\t')
-            parsed = json.loads(fixed)
+            with open(p, encoding="utf-8") as f:
+                cookie_list = json.load(f)
+            print("Using cookie file:", p)
+            break
         except Exception as e:
-            print("Failed to parse COOKIES_SECRET as JSON; attempting to heuristically extract JSON array...")
-            # attempt to find first '[' and last ']' and parse slice
-            lb = candidate.find('[')
-            rb = candidate.rfind(']')
-            if lb != -1 and rb != -1 and rb > lb:
-                try:
-                    parsed = json.loads(candidate[lb:rb+1])
-                except Exception as e2:
-                    print("Heuristic parse failed:", e2)
-                    parsed = None
-            else:
-                parsed = None
+            print("Failed to parse", p, e)
 
-    if not parsed:
-        print("ERROR: could not parse cookie JSON from secret. Please ensure the secret contains the cookie JSON array.")
-        return False
+if not cookie_list:
+    print("ERROR: no cookie JSON found or parse failed. Aborting diagnostic.")
+    sys.exit(2)
 
-    if not isinstance(parsed, list):
-        print("ERROR: parsed cookie content is not a JSON array/list.")
-        return False
+def to_dict(lst):
+    d = {}
+    for c in lst:
+        n = c.get("name"); v = c.get("value")
+        if n and v:
+            d[n] = v
+    return d
 
-    # Write to each path
-    for p in COOKIE_OUT_PATHS:
-        d = os.path.dirname(p)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(p, "w", encoding="utf-8") as fh:
-            json.dump(parsed, fh, ensure_ascii=False, indent=2)
-        print("Wrote cookie file:", p, "entries:", len(parsed))
+cookie_dict = to_dict(cookie_list)
+print("Cookie keys (sample up to 20):", list(cookie_dict.keys())[:20])
+for reqk in ("sessionid","ds_user_id","csrftoken"):
+    print(reqk, "present:", reqk in cookie_dict)
+headers = {
+    "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36"
+}
+test_user = "thepreetjohal"
+url = f"https://www.instagram.com/{test_user}/"
+print("GET", url)
+try:
+    r = requests.get(url, cookies=cookie_dict, headers=headers, timeout=30)
+except Exception as e:
+    print("Request failed:", e)
+    sys.exit(3)
+print("HTTP status:", r.status_code)
+m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.I|re.S)
+title = m.group(1).strip() if m else ""
+print("Page title:", title[:200])
+os.makedirs("data", exist_ok=True)
+with open("data/debug_diagnose.html","w",encoding="utf-8") as fh:
+    fh.write(r.text)
+print("Saved data/debug_diagnose.html size:", len(r.text))
+if r.status_code in (403,429):
+    print("Blocked or rate-limited (status code)", r.status_code); sys.exit(4)
+if "Log in" in title or "Login" in title or "Sign up" in title:
+    print("Heuristic: login page returned (cookies invalid or blocked)."); sys.exit(5)
+print("Diagnostic looks OK (profile page returned).")
+sys.exit(0)
+PY
+          python diag.py
 
-    # quick print of cookie names
-    names = [c.get("name") for c in parsed if isinstance(c, dict) and "name" in c]
-    print("Cookie names (sample up to 40):", names[:40])
-    return True
+      - name: Run detected scraper
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          echo "Detected scraper: ${{ steps.detect_scraper.outputs.scraper }}"
+          if [ "${{ steps.detect_scraper.outputs.scraper }}" = "scrape_profiles.py" ]; then
+            echo "Running scrape_profiles.py"
+            python scrape_profiles.py
+          elif [ "${{ steps.detect_scraper.outputs.scraper }}" = "scrape_followers.py" ]; then
+            echo "Running scrape_followers.py"
+            python scrape_followers.py
+          else
+            echo "No known scraper detected; aborting"
+            exit 1
+          fi
 
-def diagnostic_fetch():
-    import requests
-    paths = COOKIE_OUT_PATHS
-    cookie_list = None
-    for p in paths:
-        if Path(p).exists():
-            try:
-                cookie_list = json.load(open(p, encoding="utf-8"))
-                print("Using cookie file:", p)
-                break
-            except Exception as e:
-                print("Failed to parse", p, ":", e)
-    if not cookie_list:
-        print("No cookie file available for diagnostic.")
-        return False
+      - name: Show results preview and data folder listing
+        run: |
+          echo "=== results.csv preview (first 40 lines) ==="
+          if [ -f data/results.csv ]; then head -n 40 data/results.csv || true; else echo "No data/results.csv produced"; fi
+          echo
+          echo "=== data folder listing ==="
+          ls -la data || true
+          echo "=== root listing ==="
+          ls -la
 
-    # convert into requests cookie dict
-    cookie_dict = {}
-    for c in cookie_list:
-        if not isinstance(c, dict):
-            continue
-        name = c.get("name"); val = c.get("value")
-        if name and val is not None:
-            cookie_dict[name] = val
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36"
-    }
-
-    url = f"https://www.instagram.com/{DEBUG_TEST_USERNAME}/"
-    print("Diagnostic GET", url)
-    try:
-        r = requests.get(url, cookies=cookie_dict, headers=headers, timeout=30)
-    except Exception as e:
-        print("Diagnostic request failed:", e)
-        return False
-
-    print("HTTP status:", r.status_code)
-    html = r.text
-    os.makedirs("data", exist_ok=True)
-    with open("data/debug_diagnose.html", "w", encoding="utf-8") as fh:
-        fh.write(html)
-    print("Saved data/debug_diagnose.html size:", len(html))
-
-    # Heuristics
-    if r.status_code in (403, 429):
-        print("Diagnostic: blocked or rate limited (status code)", r.status_code)
-        return False
-
-    title_ok = False
-    try:
-        import re
-        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-        title = m.group(1).strip() if m else ""
-        print("Page title:", title[:200])
-        if "Log in" in title or "Login" in title or "Sign up" in title:
-            print("Diagnostic heuristic: looks like a login/landing page — cookies invalid or blocked.")
-            return False
-        title_ok = True
-    except Exception:
-        pass
-
-    print("Diagnostic looks OK (profile page returned).")
-    return title_ok
-
-def run_scraper_wrapper():
-    ok = load_secret_and_write = None
-    ok = load_secret_and_write = load_secret_and_write_wrapper()
-
-def load_secret_and_write_wrapper():
-    return load_secret_and_write()
-
-def main():
-    # Step 1: create data folders
-    os.makedirs("data", exist_ok=True)
-    os.makedirs("cookies", exist_ok=True)
-
-    print("Step: write/validate COOKIES_SECRET -> cookie files")
-    if not load_secret_and_write_wrapper():
-        print("Cookie write/validation failed. Aborting.")
-        sys.exit(20)
-
-    print("Step: run diagnostic fetch (profile page) -> data/debug_diagnose.html")
-    diag_ok = False
-    try:
-        diag_ok = diagnostic_fetch()
-    except Exception as e:
-        print("Diagnostic fetch exception:", e)
-        diag_ok = False
-
-    if not diag_ok:
-        print("Warning: diagnostic fetch did not pass. The scraper may still run but likely will be blocked or land on login page.")
-
-    # Step: run the scraper script
-    scraper_script = "scrape_profiles.py"
-    if not Path(scraper_script).exists():
-        print(f"ERROR: {scraper_script} not found in repo root. Aborting.")
-        sys.exit(21)
-
-    print("Running scraper:", scraper_script)
-    # Run in the same environment so the scraper can pick up files we've written
-    rc = subprocess.call([sys.executable, scraper_script])
-    print("Scraper exited with code:", rc)
-    sys.exit(rc if isinstance(rc, int) else 1)
-
-if __name__ == "__main__":
-    main()
+      - name: Upload artifacts (results + debug HTML/png)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ig-scraper-artifacts
+          path: |
+            data/**
+            debug_*.png
+            debug_*.html
+            www.instagram.com.cookies.json
+            cookies/www.instagram.com.cookies.json
